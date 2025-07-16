@@ -9,8 +9,16 @@
 (define-constant ERR_ALREADY_MEMBER (err u107))
 (define-constant ERR_INSUFFICIENT_REPUTATION (err u108))
 (define-constant ERR_LOAN_OVERDUE (err u109))
+(define-constant ERR_PROPOSAL_NOT_FOUND (err u110))
+(define-constant ERR_PROPOSAL_EXPIRED (err u111))
+(define-constant ERR_PROPOSAL_ALREADY_EXECUTED (err u112))
+(define-constant ERR_ALREADY_VOTED_ON_PROPOSAL (err u113))
+(define-constant ERR_PROPOSAL_NOT_READY (err u114))
 
 (define-data-var next-loan-id uint u1)
+(define-data-var next-proposal-id uint u1)
+(define-data-var proposal-duration-blocks uint u1008)
+(define-data-var governance-quorum uint u5)
 (define-data-var total-pool-balance uint u0)
 (define-data-var min-reputation-score uint u50)
 (define-data-var max-loan-amount uint u10000)
@@ -36,6 +44,19 @@
 (define-map member-contributions principal uint)
 (define-map loan-votes {loan-id: uint, voter: principal} bool)
 (define-map loan-approval-count uint uint)
+
+(define-map governance-proposals uint {
+    proposer: principal,
+    parameter: (string-ascii 32),
+    new-value: uint,
+    start-block: uint,
+    end-block: uint,
+    executed: bool,
+    description: (string-ascii 256)
+})
+
+(define-map proposal-votes {proposal-id: uint, voter: principal} bool)
+(define-map proposal-vote-count uint {yes: uint, no: uint})
 
 (define-public (join-dao)
     (let ((caller tx-sender))
@@ -272,13 +293,114 @@
     (is-some (map-get? loan-votes {loan-id: loan-id, voter: voter}))
 )
 
+(define-public (create-governance-proposal (parameter (string-ascii 32)) (new-value uint) (description (string-ascii 256)))
+    (let (
+        (caller tx-sender)
+        (proposal-id (var-get next-proposal-id))
+        (member-data (unwrap! (map-get? dao-members caller) ERR_MEMBER_NOT_FOUND))
+    )
+        (asserts! (>= (get reputation-score member-data) u150) ERR_INSUFFICIENT_REPUTATION)
+        
+        (map-set governance-proposals proposal-id {
+            proposer: caller,
+            parameter: parameter,
+            new-value: new-value,
+            start-block: stacks-block-height,
+            end-block: (+ stacks-block-height (var-get proposal-duration-blocks)),
+            executed: false,
+            description: description
+        })
+        
+        (map-set proposal-vote-count proposal-id {yes: u0, no: u0})
+        (var-set next-proposal-id (+ proposal-id u1))
+        (ok proposal-id)
+    )
+)
+
+(define-public (vote-on-proposal (proposal-id uint) (support bool))
+    (let (
+        (caller tx-sender)
+        (member-data (unwrap! (map-get? dao-members caller) ERR_MEMBER_NOT_FOUND))
+        (proposal-data (unwrap! (map-get? governance-proposals proposal-id) ERR_PROPOSAL_NOT_FOUND))
+        (current-votes (unwrap! (map-get? proposal-vote-count proposal-id) ERR_PROPOSAL_NOT_FOUND))
+    )
+        (asserts! (>= (get reputation-score member-data) u100) ERR_INSUFFICIENT_REPUTATION)
+        (asserts! (<= stacks-block-height (get end-block proposal-data)) ERR_PROPOSAL_EXPIRED)
+        (asserts! (is-none (map-get? proposal-votes {proposal-id: proposal-id, voter: caller})) ERR_ALREADY_VOTED_ON_PROPOSAL)
+        
+        (map-set proposal-votes {proposal-id: proposal-id, voter: caller} support)
+        
+        (if support
+            (map-set proposal-vote-count proposal-id 
+                (merge current-votes {yes: (+ (get yes current-votes) u1)}))
+            (map-set proposal-vote-count proposal-id 
+                (merge current-votes {no: (+ (get no current-votes) u1)}))
+        )
+        (ok true)
+    )
+)
+
+(define-public (execute-proposal (proposal-id uint))
+    (let (
+        (proposal-data (unwrap! (map-get? governance-proposals proposal-id) ERR_PROPOSAL_NOT_FOUND))
+        (vote-count (unwrap! (map-get? proposal-vote-count proposal-id) ERR_PROPOSAL_NOT_FOUND))
+        (yes-votes (get yes vote-count))
+        (no-votes (get no vote-count))
+        (total-votes (+ yes-votes no-votes))
+    )
+        (asserts! (> stacks-block-height (get end-block proposal-data)) ERR_PROPOSAL_NOT_READY)
+        (asserts! (not (get executed proposal-data)) ERR_PROPOSAL_ALREADY_EXECUTED)
+        (asserts! (>= total-votes (var-get governance-quorum)) ERR_NOT_AUTHORIZED)
+        (asserts! (> yes-votes no-votes) ERR_NOT_AUTHORIZED)
+        
+        (map-set governance-proposals proposal-id 
+            (merge proposal-data {executed: true}))
+        
+        (let ((parameter (get parameter proposal-data))
+              (new-value (get new-value proposal-data)))
+            (if (is-eq parameter "min-reputation-score")
+                (var-set min-reputation-score new-value)
+                (if (is-eq parameter "max-loan-amount")
+                    (var-set max-loan-amount new-value)
+                    (if (is-eq parameter "loan-duration-blocks")
+                        (var-set loan-duration-blocks new-value)
+                        (if (is-eq parameter "governance-quorum")
+                            (var-set governance-quorum new-value)
+                            (if (is-eq parameter "proposal-duration-blocks")
+                                (var-set proposal-duration-blocks new-value)
+                                false
+                            )
+                        )
+                    )
+                )
+            )
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-proposal-info (proposal-id uint))
+    (map-get? governance-proposals proposal-id)
+)
+
+(define-read-only (get-proposal-votes (proposal-id uint))
+    (map-get? proposal-vote-count proposal-id)
+)
+
+(define-read-only (has-voted-on-proposal (proposal-id uint) (voter principal))
+    (is-some (map-get? proposal-votes {proposal-id: proposal-id, voter: voter}))
+)
+
 (define-read-only (get-contract-info)
     {
         total-pool-balance: (var-get total-pool-balance),
         next-loan-id: (var-get next-loan-id),
+        next-proposal-id: (var-get next-proposal-id),
         min-reputation-score: (var-get min-reputation-score),
         max-loan-amount: (var-get max-loan-amount),
-        loan-duration-blocks: (var-get loan-duration-blocks)
+        loan-duration-blocks: (var-get loan-duration-blocks),
+        proposal-duration-blocks: (var-get proposal-duration-blocks),
+        governance-quorum: (var-get governance-quorum)
     }
 )
 
