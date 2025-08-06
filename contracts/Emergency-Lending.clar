@@ -14,6 +14,8 @@
 (define-constant ERR_PROPOSAL_ALREADY_EXECUTED (err u112))
 (define-constant ERR_ALREADY_VOTED_ON_PROPOSAL (err u113))
 (define-constant ERR_PROPOSAL_NOT_READY (err u114))
+(define-constant ERR_INVALID_REFERRER (err u115))
+(define-constant ERR_SELF_REFERRAL (err u116))
 
 (define-data-var next-loan-id uint u1)
 (define-data-var next-proposal-id uint u1)
@@ -29,7 +31,9 @@
     total-borrowed: uint,
     total-repaid: uint,
     active-loans: uint,
-    join-block: uint
+    join-block: uint,
+    referrer: (optional principal),
+    referral-count: uint
 })
 
 (define-map loans uint {
@@ -68,8 +72,35 @@
                     total-borrowed: u0,
                     total-repaid: u0,
                     active-loans: u0,
-                    join-block: stacks-block-height
+                    join-block: stacks-block-height,
+                    referrer: none,
+                    referral-count: u0
                 })
+                (ok true)
+            )
+        )
+    )
+)
+
+(define-public (join-dao-with-referral (referrer-address principal))
+    (let ((caller tx-sender))
+        (asserts! (not (is-eq caller referrer-address)) ERR_SELF_REFERRAL)
+        (asserts! (is-some (map-get? dao-members referrer-address)) ERR_INVALID_REFERRER)
+        
+        (match (map-get? dao-members caller)
+            existing-member ERR_ALREADY_MEMBER
+            (begin
+                (map-set dao-members caller {
+                    reputation-score: u110,
+                    total-borrowed: u0,
+                    total-repaid: u0,
+                    active-loans: u0,
+                    join-block: stacks-block-height,
+                    referrer: (some referrer-address),
+                    referral-count: u0
+                })
+                (update-referrer-count referrer-address)
+                (update-member-reputation referrer-address 25)
                 (ok true)
             )
         )
@@ -269,6 +300,16 @@
     )
 )
 
+(define-private (update-referrer-count (referrer principal))
+    (match (map-get? dao-members referrer)
+        member-data 
+        (map-set dao-members referrer 
+            (merge member-data {referral-count: (+ (get referral-count member-data) u1)})
+        )
+        false
+    )
+)
+
 (define-read-only (get-member-info (member principal))
     (map-get? dao-members member)
 )
@@ -389,6 +430,20 @@
 
 (define-read-only (has-voted-on-proposal (proposal-id uint) (voter principal))
     (is-some (map-get? proposal-votes {proposal-id: proposal-id, voter: voter}))
+)
+
+(define-read-only (get-member-referrals (member principal))
+    (match (map-get? dao-members member)
+        member-data (some (get referral-count member-data))
+        none
+    )
+)
+
+(define-read-only (get-member-referrer (member principal))
+    (match (map-get? dao-members member)
+        member-data (get referrer member-data)
+        none
+    )
 )
 
 (define-read-only (get-contract-info)
