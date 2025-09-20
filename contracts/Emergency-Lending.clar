@@ -16,6 +16,12 @@
 (define-constant ERR_PROPOSAL_NOT_READY (err u114))
 (define-constant ERR_INVALID_REFERRER (err u115))
 (define-constant ERR_SELF_REFERRAL (err u116))
+(define-constant ERR_CRISIS_MODE_ACTIVE (err u117))
+
+(define-constant CRISIS_THRESHOLD_HIGH u80)
+(define-constant CRISIS_THRESHOLD_MEDIUM u60)
+(define-constant CRISIS_MULTIPLIER_HIGH u150)
+(define-constant CRISIS_MULTIPLIER_MEDIUM u125)
 
 (define-data-var next-loan-id uint u1)
 (define-data-var next-proposal-id uint u1)
@@ -25,6 +31,8 @@
 (define-data-var min-reputation-score uint u50)
 (define-data-var max-loan-amount uint u10000)
 (define-data-var loan-duration-blocks uint u1440)
+(define-data-var crisis-mode-active bool false)
+(define-data-var crisis-detection-block uint u0)
 
 (define-map dao-members principal {
     reputation-score: uint,
@@ -128,9 +136,11 @@
         (caller tx-sender)
         (loan-id (var-get next-loan-id))
         (member-data (unwrap! (map-get? dao-members caller) ERR_MEMBER_NOT_FOUND))
+        (crisis-adjusted-limits (get-crisis-adjusted-limits))
     )
-        (asserts! (>= (get reputation-score member-data) (var-get min-reputation-score)) ERR_INSUFFICIENT_REPUTATION)
-        (asserts! (<= amount (var-get max-loan-amount)) ERR_INVALID_AMOUNT)
+        (check-and-update-crisis-mode)
+        (asserts! (>= (get reputation-score member-data) (get min-reputation crisis-adjusted-limits)) ERR_INSUFFICIENT_REPUTATION)
+        (asserts! (<= amount (get max-loan crisis-adjusted-limits)) ERR_INVALID_AMOUNT)
         (asserts! (>= (var-get total-pool-balance) amount) ERR_INSUFFICIENT_BALANCE)
         (asserts! (< (get active-loans member-data) u3) ERR_NOT_AUTHORIZED)
         
@@ -140,7 +150,7 @@
             due-block: (+ stacks-block-height (var-get loan-duration-blocks)),
             repaid: false,
             created-block: stacks-block-height,
-            interest-rate: u5
+            interest-rate: (get-crisis-interest-rate)
         })
         
         (map-set loan-approval-count loan-id u0)
@@ -310,6 +320,77 @@
     )
 )
 
+(define-private (calculate-pool-utilization)
+    (let (
+        (total-balance (var-get total-pool-balance))
+        (total-contributions (fold + (map get-member-contribution-for-calc (list tx-sender)) u0))
+    )
+        (if (> total-contributions u0)
+            (/ (* (- total-contributions total-balance) u100) total-contributions)
+            u0
+        )
+    )
+)
+
+(define-private (get-member-contribution-for-calc (member principal))
+    (default-to u0 (map-get? member-contributions member))
+)
+
+(define-private (check-and-update-crisis-mode)
+    (let ((utilization (calculate-pool-utilization)))
+        (if (>= utilization CRISIS_THRESHOLD_HIGH)
+            (begin
+                (var-set crisis-mode-active true)
+                (var-set crisis-detection-block stacks-block-height)
+                true
+            )
+            (if (and (var-get crisis-mode-active) 
+                     (< utilization u30) 
+                     (> stacks-block-height (+ (var-get crisis-detection-block) u144)))
+                (begin
+                    (var-set crisis-mode-active false)
+                    (var-set crisis-detection-block u0)
+                    true
+                )
+                true
+            )
+        )
+    )
+)
+
+(define-private (get-crisis-adjusted-limits)
+    (let ((utilization (calculate-pool-utilization)))
+        (if (var-get crisis-mode-active)
+            (if (>= utilization CRISIS_THRESHOLD_HIGH)
+                {
+                    min-reputation: (/ (* (var-get min-reputation-score) CRISIS_MULTIPLIER_HIGH) u100),
+                    max-loan: (/ (* (var-get max-loan-amount) u100) CRISIS_MULTIPLIER_HIGH)
+                }
+                {
+                    min-reputation: (/ (* (var-get min-reputation-score) CRISIS_MULTIPLIER_MEDIUM) u100),
+                    max-loan: (/ (* (var-get max-loan-amount) u100) CRISIS_MULTIPLIER_MEDIUM)
+                }
+            )
+            {
+                min-reputation: (var-get min-reputation-score),
+                max-loan: (var-get max-loan-amount)
+            }
+        )
+    )
+)
+
+(define-private (get-crisis-interest-rate)
+    (let ((utilization (calculate-pool-utilization)))
+        (if (var-get crisis-mode-active)
+            (if (>= utilization CRISIS_THRESHOLD_HIGH)
+                u15
+                u10
+            )
+            u5
+        )
+    )
+)
+
 (define-read-only (get-member-info (member principal))
     (map-get? dao-members member)
 )
@@ -456,6 +537,16 @@
         loan-duration-blocks: (var-get loan-duration-blocks),
         proposal-duration-blocks: (var-get proposal-duration-blocks),
         governance-quorum: (var-get governance-quorum)
+    }
+)
+
+(define-read-only (get-crisis-status)
+    {
+        crisis-active: (var-get crisis-mode-active),
+        pool-utilization: (calculate-pool-utilization),
+        crisis-detection-block: (var-get crisis-detection-block),
+        current-interest-rate: (get-crisis-interest-rate),
+        adjusted-limits: (get-crisis-adjusted-limits)
     }
 )
 
