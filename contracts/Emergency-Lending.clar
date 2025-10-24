@@ -17,6 +17,11 @@
 (define-constant ERR_INVALID_REFERRER (err u115))
 (define-constant ERR_SELF_REFERRAL (err u116))
 (define-constant ERR_CRISIS_MODE_ACTIVE (err u117))
+(define-constant ERR_EXTENSION_NOT_FOUND (err u118))
+(define-constant ERR_EXTENSION_ALREADY_EXISTS (err u119))
+(define-constant ERR_EXTENSION_ALREADY_PROCESSED (err u120))
+(define-constant ERR_MAX_EXTENSIONS_REACHED (err u121))
+(define-constant ERR_EXTENSION_DENIED (err u122))
 
 (define-constant CRISIS_THRESHOLD_HIGH u80)
 (define-constant CRISIS_THRESHOLD_MEDIUM u60)
@@ -33,6 +38,9 @@
 (define-data-var loan-duration-blocks uint u1440)
 (define-data-var crisis-mode-active bool false)
 (define-data-var crisis-detection-block uint u0)
+(define-data-var next-extension-id uint u1)
+(define-data-var extension-duration-blocks uint u720)
+(define-data-var max-extensions-per-loan uint u2)
 
 (define-map dao-members principal {
     reputation-score: uint,
@@ -69,6 +77,21 @@
 
 (define-map proposal-votes {proposal-id: uint, voter: principal} bool)
 (define-map proposal-vote-count uint {yes: uint, no: uint})
+
+(define-map extension-requests uint {
+    loan-id: uint,
+    borrower: principal,
+    reason: (string-ascii 256),
+    requested-at: uint,
+    processed: bool,
+    approved: bool,
+    processed-at: (optional uint),
+    extension-count: uint
+})
+
+(define-map extension-votes {extension-id: uint, voter: principal} bool)
+(define-map extension-approval-count uint uint)
+(define-map loan-extension-count uint uint)
 
 (define-public (join-dao)
     (let ((caller tx-sender))
@@ -547,6 +570,149 @@
         crisis-detection-block: (var-get crisis-detection-block),
         current-interest-rate: (get-crisis-interest-rate),
         adjusted-limits: (get-crisis-adjusted-limits)
+    }
+)
+
+(define-public (request-loan-extension (loan-id uint) (reason (string-ascii 256)))
+    (let (
+        (caller tx-sender)
+        (extension-id (var-get next-extension-id))
+        (loan-data (unwrap! (map-get? loans loan-id) ERR_LOAN_NOT_FOUND))
+        (member-data (unwrap! (map-get? dao-members caller) ERR_MEMBER_NOT_FOUND))
+        (current-extensions (default-to u0 (map-get? loan-extension-count loan-id)))
+    )
+        (asserts! (is-eq caller (get borrower loan-data)) ERR_NOT_AUTHORIZED)
+        (asserts! (not (get repaid loan-data)) ERR_LOAN_ALREADY_REPAID)
+        (asserts! (< current-extensions (var-get max-extensions-per-loan)) ERR_MAX_EXTENSIONS_REACHED)
+        (asserts! (> (get due-block loan-data) stacks-block-height) ERR_LOAN_OVERDUE)
+        (asserts! (>= (get reputation-score member-data) u75) ERR_INSUFFICIENT_REPUTATION)
+        (asserts! (is-none (get-pending-extension-for-loan loan-id)) ERR_EXTENSION_ALREADY_EXISTS)
+        
+        (map-set extension-requests extension-id {
+            loan-id: loan-id,
+            borrower: caller,
+            reason: reason,
+            requested-at: stacks-block-height,
+            processed: false,
+            approved: false,
+            processed-at: none,
+            extension-count: current-extensions
+        })
+        
+        (map-set extension-approval-count extension-id u0)
+        (var-set next-extension-id (+ extension-id u1))
+        (ok extension-id)
+    )
+)
+
+(define-public (vote-on-extension (extension-id uint) (approve bool))
+    (let (
+        (caller tx-sender)
+        (member-data (unwrap! (map-get? dao-members caller) ERR_MEMBER_NOT_FOUND))
+        (extension-data (unwrap! (map-get? extension-requests extension-id) ERR_EXTENSION_NOT_FOUND))
+    )
+        (asserts! (>= (get reputation-score member-data) u100) ERR_INSUFFICIENT_REPUTATION)
+        (asserts! (not (get processed extension-data)) ERR_EXTENSION_ALREADY_PROCESSED)
+        (asserts! (is-none (map-get? extension-votes {extension-id: extension-id, voter: caller})) ERR_NOT_AUTHORIZED)
+        
+        (map-set extension-votes {extension-id: extension-id, voter: caller} approve)
+        
+        (if approve
+            (map-set extension-approval-count extension-id 
+                (+ (default-to u0 (map-get? extension-approval-count extension-id)) u1))
+            true
+        )
+        (ok true)
+    )
+)
+
+(define-public (process-extension-request (extension-id uint))
+    (let (
+        (extension-data (unwrap! (map-get? extension-requests extension-id) ERR_EXTENSION_NOT_FOUND))
+        (approval-count (default-to u0 (map-get? extension-approval-count extension-id)))
+        (loan-id (get loan-id extension-data))
+        (loan-data (unwrap! (map-get? loans loan-id) ERR_LOAN_NOT_FOUND))
+        (approved (>= approval-count u3))
+    )
+        (asserts! (not (get processed extension-data)) ERR_EXTENSION_ALREADY_PROCESSED)
+        (asserts! (not (get repaid loan-data)) ERR_LOAN_ALREADY_REPAID)
+        
+        (map-set extension-requests extension-id 
+            (merge extension-data {
+                processed: true,
+                approved: approved,
+                processed-at: (some stacks-block-height)
+            })
+        )
+        
+        (if approved
+            (begin
+                (map-set loans loan-id 
+                    (merge loan-data {
+                        due-block: (+ (get due-block loan-data) (var-get extension-duration-blocks))
+                    })
+                )
+                (map-set loan-extension-count loan-id 
+                    (+ (default-to u0 (map-get? loan-extension-count loan-id)) u1))
+                (update-member-reputation (get borrower extension-data) -5)
+                (ok true)
+            )
+            (begin
+                (update-member-reputation (get borrower extension-data) -15)
+                ERR_EXTENSION_DENIED
+            )
+        )
+    )
+)
+
+(define-private (get-pending-extension-for-loan (loan-id uint))
+    (let ((extension-id (- (var-get next-extension-id) u1)))
+        (match (map-get? extension-requests extension-id)
+            ext-data
+                (if (and (is-eq (get loan-id ext-data) loan-id) (not (get processed ext-data)))
+                    (some extension-id)
+                    (check-previous-extension loan-id (- extension-id u1))
+                )
+            none
+        )
+    )
+)
+
+(define-private (check-previous-extension (loan-id uint) (extension-id uint))
+    (if (> extension-id u0)
+        (match (map-get? extension-requests extension-id)
+            ext-data
+                (if (and (is-eq (get loan-id ext-data) loan-id) (not (get processed ext-data)))
+                    (some extension-id)
+                    none
+                )
+            none
+        )
+        none
+    )
+)
+
+(define-read-only (get-extension-request (extension-id uint))
+    (map-get? extension-requests extension-id)
+)
+
+(define-read-only (get-extension-approval-count (extension-id uint))
+    (default-to u0 (map-get? extension-approval-count extension-id))
+)
+
+(define-read-only (has-voted-on-extension (extension-id uint) (voter principal))
+    (is-some (map-get? extension-votes {extension-id: extension-id, voter: voter}))
+)
+
+(define-read-only (get-loan-extension-count (loan-id uint))
+    (default-to u0 (map-get? loan-extension-count loan-id))
+)
+
+(define-read-only (get-extension-config)
+    {
+        next-extension-id: (var-get next-extension-id),
+        extension-duration-blocks: (var-get extension-duration-blocks),
+        max-extensions-per-loan: (var-get max-extensions-per-loan)
     }
 )
 
