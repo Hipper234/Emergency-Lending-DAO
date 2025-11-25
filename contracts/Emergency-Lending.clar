@@ -22,6 +22,8 @@
 (define-constant ERR_EXTENSION_ALREADY_PROCESSED (err u120))
 (define-constant ERR_MAX_EXTENSIONS_REACHED (err u121))
 (define-constant ERR_EXTENSION_DENIED (err u122))
+(define-constant ERR_HAS_GUARANTOR (err u123))
+(define-constant ERR_CANNOT_VOUCH_SELF (err u124))
 
 (define-constant CRISIS_THRESHOLD_HIGH u80)
 (define-constant CRISIS_THRESHOLD_MEDIUM u60)
@@ -92,6 +94,10 @@
 (define-map extension-votes {extension-id: uint, voter: principal} bool)
 (define-map extension-approval-count uint uint)
 (define-map loan-extension-count uint uint)
+(define-map loan-guarantors uint {
+    guarantor: principal,
+    stake: uint
+})
 
 (define-public (join-dao)
     (let ((caller tx-sender))
@@ -245,6 +251,11 @@
             (update-member-reputation caller 20)
             (update-member-reputation caller -10)
         )
+        (match (map-get? loan-guarantors loan-id)
+            guarantor-data
+            (update-member-reputation (get guarantor guarantor-data) (to-int (/ (get stake guarantor-data) u10)))
+            false
+        )
         (ok true)
     )
 )
@@ -260,6 +271,32 @@
         (update-member-reputation borrower -50)
         (update-member-active-loans borrower -1)
         (map-set loans loan-id (merge loan-data {repaid: true}))
+        (match (map-get? loan-guarantors loan-id)
+            guarantor-data
+            (update-member-reputation (get guarantor guarantor-data) (* (to-int (get stake guarantor-data)) -1))
+            false
+        )
+        (ok true)
+    )
+)
+
+(define-public (vouch-for-loan (loan-id uint) (stake uint))
+    (let (
+        (caller tx-sender)
+        (loan-data (unwrap! (map-get? loans loan-id) ERR_LOAN_NOT_FOUND))
+        (member-data (unwrap! (map-get? dao-members caller) ERR_MEMBER_NOT_FOUND))
+    )
+        (asserts! (not (is-eq caller (get borrower loan-data))) ERR_CANNOT_VOUCH_SELF)
+        (asserts! (not (get repaid loan-data)) ERR_LOAN_ALREADY_REPAID)
+        (asserts! (<= stacks-block-height (get due-block loan-data)) ERR_LOAN_OVERDUE)
+        (asserts! (is-none (map-get? loan-guarantors loan-id)) ERR_HAS_GUARANTOR)
+        (asserts! (>= (get reputation-score member-data) stake) ERR_INSUFFICIENT_REPUTATION)
+        (asserts! (> stake u0) ERR_INVALID_AMOUNT)
+        
+        (map-set loan-guarantors loan-id {
+            guarantor: caller,
+            stake: stake
+        })
         (ok true)
     )
 )
